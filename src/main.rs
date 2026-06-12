@@ -15,9 +15,10 @@ use ratatui::{
 
 struct AppData {
     endpoints: Vec<Endpoint>,
-    logic_delta_time_ms: u64,
+    tick_time_ms: u64,
     gui_refresh_interval_ms: u64,
     history_max_width: usize,
+    history_entry_timeframe_ms: u64
 }
 
 struct Endpoint {
@@ -29,13 +30,26 @@ struct Endpoint {
 
 struct VolatileAppData<'a> {
     since_last_gui_refresh_ms: u64,
+    since_last_new_history_timeframe_ms: u64,
     endpoints: Vec<EndpointVolatileData<'a>>
 }
 
 struct EndpointVolatileData<'a> {
     endpoint_reference: &'a Endpoint,
-    history: Vec<bool>,
-    time_since_last_poll_ms: u64
+    history: Vec<HistoryEntry>,
+    time_since_last_poll_ms: u64,
+    needs_new_history_entry: bool
+}
+
+struct HistoryEntry {
+    history_state: HistoryState
+}
+
+#[derive(PartialEq)]
+enum HistoryState {
+    AllSuccesses,
+    PartialSuccesses,
+    AllFailures
 }
 
 async fn smack_endpoint(endpoint: &Endpoint) -> bool {
@@ -50,11 +64,52 @@ async fn smack_endpoint(endpoint: &Endpoint) -> bool {
     };
 }
 
+fn write_to_history(app_data: &AppData, endpoint: &mut EndpointVolatileData<'_>, is_success: bool) {
+
+    /*
+     * If we are writing new history entry:
+     *     - push new entry
+     *     - cull earliest entry if we are too long
+     *     - return
+     */
+
+    if endpoint.needs_new_history_entry {
+        if is_success {
+            endpoint.history.push(HistoryEntry {
+                history_state: HistoryState::AllSuccesses
+            });
+        } else {
+            endpoint.history.push(HistoryEntry {
+                history_state: HistoryState::AllFailures
+            });
+        }
+
+        if endpoint.history.len() > app_data.history_max_width {
+            endpoint.history.remove(0);
+        }
+
+        endpoint.needs_new_history_entry = false;
+        return;
+    }
+
+    if let Some(last_entry) = endpoint.history.last_mut() {
+        if is_success && last_entry.history_state == HistoryState::AllFailures {
+            last_entry.history_state = HistoryState::PartialSuccesses;
+        }
+    
+        if !is_success && last_entry.history_state == HistoryState::AllSuccesses {
+            last_entry.history_state = HistoryState::PartialSuccesses;
+        }
+    }
+
+}
+
 async fn update_endpoints(app_data: &AppData, volatile_app_data: &mut VolatileAppData<'_>) {
+
     for endpoint in &mut volatile_app_data.endpoints {
 
         // Skip healthcheck if we have not waited long enough
-        endpoint.time_since_last_poll_ms += app_data.logic_delta_time_ms;
+        endpoint.time_since_last_poll_ms += app_data.tick_time_ms;
         if endpoint.time_since_last_poll_ms < endpoint.endpoint_reference.poll_time_ms {
             continue
         }
@@ -63,18 +118,18 @@ async fn update_endpoints(app_data: &AppData, volatile_app_data: &mut VolatileAp
 
         let is_success: bool = smack_endpoint(endpoint.endpoint_reference).await;
 
-        endpoint.history.push(is_success);
-
-        if endpoint.history.len() > app_data.history_max_width {
-            endpoint.history.remove(0);
-        }
+        write_to_history(app_data, endpoint, is_success);
     }
 }
 
-fn render_history(history: &[bool]) -> String {
+fn render_history(history: &[HistoryEntry]) -> String {
     history
         .iter()
-        .map(|is_success: &bool| if *is_success { "█ " } else { "░ " })
+        .map(|entry| match entry.history_state {
+            HistoryState::AllSuccesses => "█ ",
+            HistoryState::PartialSuccesses => "▒ ",
+            HistoryState::AllFailures => "░ ",
+        })
         .collect()
 }
 
@@ -114,8 +169,9 @@ async fn run_app(
     app_data: AppData,
 ) -> io::Result<()> {
 
-    let mut volatile_app_data = VolatileAppData { 
+    let mut volatile_app_data: VolatileAppData<'_> = VolatileAppData { 
         since_last_gui_refresh_ms: 0,
+        since_last_new_history_timeframe_ms: 0,
         endpoints: vec![],
     };
 
@@ -124,13 +180,14 @@ async fn run_app(
             EndpointVolatileData {
                 endpoint_reference: endpoint,
                 history: vec![],
-                time_since_last_poll_ms: 0
+                time_since_last_poll_ms: 0,
+                needs_new_history_entry: true
             }
         );
     }
 
     loop {
-
+        
         // Poll for 'Q' to quit application
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
@@ -140,18 +197,27 @@ async fn run_app(
             }
         }
 
+        volatile_app_data.since_last_new_history_timeframe_ms += app_data.tick_time_ms;
+        if volatile_app_data.since_last_new_history_timeframe_ms >= app_data.history_entry_timeframe_ms {
+            
+            for endpoint in &mut volatile_app_data.endpoints {
+                endpoint.needs_new_history_entry = true;
+            }
+            volatile_app_data.since_last_new_history_timeframe_ms = 0;
+        }
+
         // Check and run healthchecks
         update_endpoints(&app_data, &mut volatile_app_data).await;
 
         // Draw interface if it has been long enough
-        volatile_app_data.since_last_gui_refresh_ms += app_data.logic_delta_time_ms;
+        volatile_app_data.since_last_gui_refresh_ms += app_data.tick_time_ms;
         if volatile_app_data.since_last_gui_refresh_ms >= app_data.gui_refresh_interval_ms {
             draw_ui(terminal, &volatile_app_data)?;
             volatile_app_data.since_last_gui_refresh_ms = 0;
         }
 
         // Sleep until next tick
-        tokio::time::sleep(Duration::from_millis(app_data.logic_delta_time_ms)).await;
+        tokio::time::sleep(Duration::from_millis(app_data.tick_time_ms)).await;
     }
 }
 
@@ -163,7 +229,7 @@ async fn main() -> io::Result<()> {
                 name: "Google".to_string(),
                 url: "https://clients3.google.com/generate_204".to_string(),
                 expected_code: 204,
-                poll_time_ms: 3000,
+                poll_time_ms: 5000,
             },
             Endpoint {
                 name: "Cloudflare".to_string(),
@@ -173,8 +239,9 @@ async fn main() -> io::Result<()> {
             },
         ],
         gui_refresh_interval_ms: 1000,
-        logic_delta_time_ms: 10,
-        history_max_width: 24,
+        tick_time_ms: 10,
+        history_max_width: 60,
+        history_entry_timeframe_ms: 1000 * 60
     };
 
     enable_raw_mode()?;
